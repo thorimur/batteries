@@ -126,29 +126,63 @@ def lintCore (decls : Array Name) (linters : Array NamedLinter)
   let env ← getEnv
   let options ← getOptions -- TODO: sanitize options?
 
-  let tasks : Array (NamedLinter × Array (Name × Task (Option MessageData))) ←
+  let decls := decls.zipIdx
+  /- If there are more than 100 decls, only sample decls for tracing such that we wind up with
+  about 100 samples. This is only to make tracing more reasonable, so we neglect handling nolints,
+  which are likely a small proportion of decls anyway. -/
+  let sampleInterval := decls.size / 100
+  let numDecls := decls.size -- `decls` changes size later; grab the size here
+  let tasks : Array <|
+      NamedLinter × Array (Name × Nat × Task (Option MessageData × PersistentArray TraceElem)) ←
     linters.mapM fun linter => do
-      let decls ← decls.filterM (shouldBeLinted linter.name)
-      (linter, ·) <$> decls.mapM fun decl => (decl, ·) <$> do
+      -- TODO: `decls` is shared here and thus copied. Avoiding this might be more performant.
+      let decls ← decls.filterM (shouldBeLinted linter.name ·.1)
+
+      (linter, ·) <$> decls.mapM fun (decl, idx) => (decl, idx, ·) <$> do
         BaseIO.asTask do
           let act : MetaM (Option MessageData) := withCurrHeartbeats do
-            traceLint "(0/2) Starting..." inIO currentModule linter.name
-            linter.test decl
+            if ← getBoolOption `trace.Batteries.Lint then
+              -- If there are <100 decls or this is the last decl, trace as normal
+              if sampleInterval = 0 || idx + 1 = numDecls then
+                traceLint s!"({idx+1}/{numDecls}) ☐ {decl}" inIO currentModule linter.name
+              -- Otherwise, trace whenever we hit a multiple of the `sampleInterval`, and use `⋯`
+              -- to suggest some will be omitted
+              else if idx % sampleInterval = 0 then
+                traceLint s!"({idx+1}⋯/{numDecls}) ☐ {decl}" inIO currentModule linter.name
+            let result ← linter.test decl
+            if inIO then
+              printTraces
+              resetTraceState
+            return result
           match ← act
               |>.run' mkMetaContext -- We use the context used by `Command.liftTermElabM`
-              |>.run' {options, fileName := "", fileMap := default} {env}
+              |>.run {options, fileName := "", fileMap := default} {env}
               |>.toBaseIO with
-          | Except.ok msg? => pure msg?
-          | Except.error err => pure m!"LINTER FAILED:\n{err.toMessageData}"
+          | Except.ok (msg?, state) => pure (msg?, state.traceState.traces)
+          -- TODO: maintain traces even during errors
+          | Except.error err => pure (some m!"LINTER FAILED:\n{err.toMessageData}", {})
 
   tasks.mapM fun (linter, decls) => do
-    traceLint "(1/2) Getting..." inIO currentModule linter.name
+    traceLint "Getting lints..." inIO currentModule linter.name
     let mut msgs : Std.HashMap Name MessageData := {}
-    for (declName, msg?) in decls do
-      if let some msg := msg?.get then
+    for (declName, idx, msg?) in decls do
+      let (msg?, traces) := msg?.get
+      unless traces.isEmpty do
+        modifyTraces (· ++ traces)
+      if let some msg := msg? then
         msgs := msgs.insert declName msg
+      if ← getBoolOption `trace.Batteries.Lint then
+        -- If there are <100 decls or this is the last decl, trace as normal
+        if sampleInterval = 0 || idx + 1 = numDecls then
+          traceLint s!"({idx+1}/{numDecls}) \
+            {if msg?.isSome then "☒" else "☑︎"} {declName}" inIO currentModule linter.name
+        -- Otherwise, trace whenever we hit a multiple of the `sampleInterval`, and use `⋯`
+        -- to suggest some will be omitted
+        else if idx % sampleInterval = 0 then
+          traceLint s!"({idx+1}⋯/{numDecls}) \
+            {if msg?.isSome then "☒" else "☑︎"} {declName}" inIO currentModule linter.name
     traceLint
-      s!"(2/2) {if msgs.isEmpty then "Passed!" else s!"Failed with {msgs.size} messages."}"
+      s!"{if msgs.isEmpty then "Passed!" else s!"Failed with {msgs.size} messages."}"
       inIO currentModule linter.name
     pure (linter, msgs)
 
